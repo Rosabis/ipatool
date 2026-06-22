@@ -25,10 +25,12 @@ type AppStore interface {
 	Download(input DownloadInput) (DownloadOutput, error)
 	// ReplicateSinf replicates the sinf for the IPA package.
 	ReplicateSinf(input ReplicateSinfInput) error
-	// VersionHistory lists the available versions of the specified app.
+	// ListVersions lists the available versions of the specified app.
 	ListVersions(input ListVersionsInput) (ListVersionsOutput, error)
 	// GetVersionMetadata returns the metadata for the specified version.
 	GetVersionMetadata(input GetVersionMetadataInput) (GetVersionMetadataOutput, error)
+	// VersionHistory retrieves version history information for the specified app.
+	VersionHistory(input VersionHistoryInput) (VersionHistoryOutput, error)
 	// Bag fetches the bag which contains endpoint definitions.
 	Bag(input BagInput) (BagOutput, error)
 }

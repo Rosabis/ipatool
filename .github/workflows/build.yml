@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build Windows amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.0"
+          cache: true
+      
+      - name: Build
+        run: |
+          go build -o ipatool-windows-amd64.exe
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipatool-windows-amd64.exe
+          path: ipatool-windows-amd64.exe
+          if-no-files-found: error
