@@ -32,13 +32,32 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
 		return BagOutput{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
 	}
 
+	endpoint := res.Data.AuthEndpoint
+	if endpoint == "" {
+		endpoint = res.Data.URLBag.AuthEndpoint
+	}
+	// The new auth endpoint requires the /fast sub-path WITH a trailing slash.
+	// Without the trailing slash Apple returns 301 + an HTML redirect page
+	// (which the plist parser chokes on), and only the appstored UA gets a
+	// (download-grade) token. With the slash, the Configurator UA mints a
+	// commerce-grade token that buyProduct accepts.
+	if strings.Contains(endpoint, "auth.itunes.apple.com") {
+		if !strings.HasSuffix(endpoint, "/fast") && !strings.HasSuffix(endpoint, "/fast/") {
+			endpoint = endpoint + "/fast"
+		}
+		if !strings.HasSuffix(endpoint, "/") {
+			endpoint = endpoint + "/"
+		}
+	}
+
 	return BagOutput{
-		AuthEndpoint: res.Data.URLBag.AuthEndpoint,
+		AuthEndpoint: endpoint,
 	}, nil
 }
 
 type bagResult struct {
-	URLBag urlBag `plist:"urlBag,omitempty"`
+	URLBag       urlBag `plist:"urlBag,omitempty"`
+	AuthEndpoint string `plist:"authenticateAccount,omitempty"`
 }
 
 type urlBag struct {

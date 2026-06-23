@@ -144,6 +144,8 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 		err = ErrAuthCodeRequired
 	} else if res.Data.FailureType == "" && res.Data.CustomerMessage == CustomerMessageAccountDisabled {
 		err = NewErrorWithMetadata(errors.New("account is disabled"), res)
+	} else if res.Data.FailureType == "" && res.Data.CustomerMessage == CustomerMessageActionSignInPage {
+		err = NewErrorWithMetadata(errors.New("account requires browser sign-in (2FA or Apple ID review required)"), res)
 	} else if res.Data.FailureType != "" {
 		if res.Data.CustomerMessage != "" {
 			err = NewErrorWithMetadata(errors.New(res.Data.CustomerMessage), res)
@@ -160,7 +162,7 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string, attempt int) http.Request {
 	return http.Request{
 		Method:         http.MethodPOST,
-		URL:            endpoint,
+		URL:            util.IfEmpty(endpoint, fmt.Sprintf("https://%s%s", PrivateAuthDomain, PrivateAuthPathNative)),
 		ResponseFormat: http.ResponseFormatXML,
 		Headers: map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
