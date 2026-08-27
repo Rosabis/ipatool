@@ -20,6 +20,7 @@ var (
 	documentXMLPattern = regexp.MustCompile(`(?is)<Document\b[^>]*>(.*)</Document>`)
 	plistXMLPattern    = regexp.MustCompile(`(?is)<plist\b[^>]*>.*?</plist>`)
 	dictXMLPattern     = regexp.MustCompile(`(?is)<dict\b[^>]*>.*</dict>`)
+	htmlTagPattern     = regexp.MustCompile(`(?is)<[^>]*>`)
 )
 
 //go:generate go run go.uber.org/mock/mockgen -source=client.go -destination=client_mock.go -package=http
@@ -36,6 +37,21 @@ type client[R interface{}] struct {
 
 type Args struct {
 	CookieJar CookieJar
+}
+
+// UnexpectedResponseError preserves the HTTP status when Apple returns an
+// HTML or empty response where an XML plist was expected.
+type UnexpectedResponseError struct {
+	StatusCode int
+	Snippet    string
+}
+
+func (e *UnexpectedResponseError) Error() string {
+	if e.Snippet == "" {
+		return fmt.Sprintf("unexpected response from Apple (HTTP %d): empty or non-plist body", e.StatusCode)
+	}
+
+	return fmt.Sprintf("unexpected response from Apple (HTTP %d): %s", e.StatusCode, e.Snippet)
 }
 
 type AddHeaderTransport struct {
@@ -164,25 +180,48 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 		return Result[R]{}, fmt.Errorf("rate limited by Apple (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	// The legacy authentication endpoint redirects to an assigned Store pod.
+	// Preserve the redirect response and its Location header so callers can
+	// repeat the original POST request at that pod.
+	if res.StatusCode >= http.StatusMultipleChoices && res.StatusCode < http.StatusBadRequest {
+		return Result[R]{
+			StatusCode: res.StatusCode,
+			Headers:    responseHeaders(res),
+		}, nil
+	}
+
 	var data R
 
 	normalizedBody := normalizeXMLPlistBody(body)
+
+	if !looksLikePropertyList(normalizedBody) {
+		snippet := bodySnippet(body)
+
+		return Result[R]{}, &UnexpectedResponseError{
+			StatusCode: res.StatusCode,
+			Snippet:    snippet,
+		}
+	}
 
 	_, err = plist.Unmarshal(normalizedBody, &data)
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w", err)
 	}
 
+	return Result[R]{
+		StatusCode: res.StatusCode,
+		Headers:    responseHeaders(res),
+		Data:       data,
+	}, nil
+}
+
+func responseHeaders(res *http.Response) map[string]string {
 	headers := map[string]string{}
 	for key, val := range res.Header {
 		headers[key] = strings.Join(val, "; ")
 	}
 
-	return Result[R]{
-		StatusCode: res.StatusCode,
-		Headers:    headers,
-		Data:       data,
-	}, nil
+	return headers
 }
 
 func normalizeXMLPlistBody(body []byte) []byte {
@@ -208,6 +247,51 @@ func normalizeXMLPlistBody(body []byte) []byte {
 	}
 
 	return normalized
+}
+
+// looksLikePropertyList reports whether body appears to be a (binary or XML)
+// property list. Apple occasionally answers with an HTML error page or a plain
+// text message; those must not be handed to plist.Unmarshal, which would
+// misinterpret a leading "<h..." as an OpenStep hex-data block and fail with an
+// opaque "unexpected hex digit" error instead of surfacing Apple's actual response.
+func looksLikePropertyList(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	if bytes.HasPrefix(trimmed, []byte("bplist")) {
+		return true
+	}
+
+	lower := bytes.ToLower(trimmed)
+	for _, marker := range [][]byte{
+		[]byte("<?xml"),
+		[]byte("<plist"),
+		[]byte("<dict"),
+		[]byte("<key"),
+	} {
+		if bytes.Contains(lower, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// bodySnippet returns a compact, single-line excerpt of a non-plist response
+// body suitable for embedding in an error message. HTML markup is stripped so
+// the underlying message (if any) is readable.
+func bodySnippet(body []byte) string {
+	text := htmlTagPattern.ReplaceAll(body, []byte(" "))
+	snippet := strings.Join(strings.Fields(string(text)), " ")
+
+	const maxLen = 200
+	if len(snippet) > maxLen {
+		snippet = snippet[:maxLen] + "…"
+	}
+
+	return snippet
 }
 
 func extractEmbeddedPlist(body []byte) []byte {

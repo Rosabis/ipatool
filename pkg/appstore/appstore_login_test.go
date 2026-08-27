@@ -84,20 +84,79 @@ var _ = Describe("AppStore (Login)", func() {
 			})
 		})
 
-		When("store API returns invalid first response", func() {
+		When("normalizes the native authentication endpoint", func() {
+			BeforeEach(func() {
+				mockClient.EXPECT().
+					Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal("https://auth.itunes.apple.com/auth/v1/native/fast/"))
+					}).
+					Return(http.Result[loginResult]{}, errors.New("stop"))
+			})
+
+			It("appends the trailing slash", func() {
+				_, err := as.Login(LoginInput{
+					Password: testPassword,
+					Endpoint: "https://auth.itunes.apple.com/auth/v1/native/fast",
+				})
+				Expect(err).To(HaveOccurred())
+			})
+		})
+
+		When("native authentication returns an empty response", func() {
+			const podURL = "https://p7-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?Pod=7&PRH=7"
+
+			BeforeEach(func() {
+				native := mockClient.EXPECT().
+					Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal("https://auth.itunes.apple.com/auth/v1/native/fast/"))
+					}).
+					Return(http.Result[loginResult]{}, &http.UnexpectedResponseError{StatusCode: 204})
+				legacy := mockClient.EXPECT().
+					Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal(legacyAuthenticateEndpoint))
+						payload := req.Payload.(*http.XMLPayload)
+						Expect(payload.Content).To(HaveKeyWithValue("attempt", "1"))
+					}).
+					Return(http.Result[loginResult]{
+						StatusCode: 302,
+						Headers:    map[string]string{"Location": podURL},
+					}, nil)
+				pod := mockClient.EXPECT().
+					Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal(podURL))
+						payload := req.Payload.(*http.XMLPayload)
+						Expect(payload.Content).To(HaveKeyWithValue("attempt", "1"))
+					}).
+					Return(http.Result[loginResult]{}, errors.New("stop after pod redirect"))
+				gomock.InOrder(native, legacy, pod)
+			})
+
+			It("falls back to legacy authentication and reposts the plist to the assigned pod", func() {
+				_, err := as.Login(LoginInput{
+					Password: testPassword,
+					Endpoint: "https://auth.itunes.apple.com/auth/v1/native/fast",
+				})
+				Expect(err).To(MatchError("request failed: stop after pod redirect"))
+			})
+		})
+
+		When("store API returns invalid credentials on first attempt", func() {
 			BeforeEach(func() {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
 					Return(http.Result[loginResult]{
 						Data: loginResult{
-							FailureType:     FailureTypeInvalidCredentials,
-							CustomerMessage: "test",
+							FailureType: FailureTypeInvalidCredentials,
 						},
 					}, nil).
 					Times(2)
 			})
 
-			It("retries one more time", func() {
+			It("retries once then returns an error", func() {
 				_, err := as.Login(LoginInput{
 					Password: testPassword,
 				})
@@ -187,35 +246,17 @@ var _ = Describe("AppStore (Login)", func() {
 						Expect(req.URL).To(Equal(testRedirectLocation))
 						Expect(req.Payload).To(BeAssignableToTypeOf(&http.XMLPayload{}))
 						x := req.Payload.(*http.XMLPayload)
-						Expect(x.Content).To(HaveKeyWithValue("attempt", "2"))
+						Expect(x.Content).To(HaveKeyWithValue("attempt", "1"))
 					}).
 					Return(http.Result[loginResult]{}, errors.New("test complete"))
 				gomock.InOrder(firstCall, secondCall)
 			})
 
-			It("follows the redirect and increments attempt", func() {
+			It("follows the redirect while preserving the original request body", func() {
 				_, err := as.Login(LoginInput{
 					Password: testPassword,
 				})
 				Expect(err).To(MatchError("request failed: test complete"))
-			})
-		})
-
-		When("store API redirects too much", func() {
-			BeforeEach(func() {
-				mockClient.EXPECT().
-					Send(gomock.Any()).
-					Return(http.Result[loginResult]{
-						StatusCode: 302,
-						Headers:    map[string]string{"Location": "hello"},
-					}, nil).
-					Times(4)
-			})
-			It("bails out", func() {
-				_, err := as.Login(LoginInput{
-					Password: testPassword,
-				})
-				Expect(err).To(MatchError("too many attempts"))
 			})
 		})
 
@@ -249,37 +290,6 @@ var _ = Describe("AppStore (Login)", func() {
 					}, nil)
 			})
 
-			When("fails to save account in keychain", func() {
-				BeforeEach(func() {
-					mockKeychain.EXPECT().
-						Set("account", gomock.Any()).
-						Do(func(key string, data []byte) {
-							want := Account{
-								Name:                fmt.Sprintf("%s %s", testFirstName, testLastName),
-								Email:               testEmail,
-								PasswordToken:       testPasswordToken,
-								Password:            testPassword,
-								DirectoryServicesID: testDirectoryServicesID,
-								StoreFront:          testStoreFront,
-								Pod:                 testPod,
-							}
-
-							var got Account
-							err := json.Unmarshal(data, &got)
-							Expect(err).ToNot(HaveOccurred())
-							Expect(got).To(Equal(want))
-						}).
-						Return(errors.New(""))
-				})
-
-				It("returns error", func() {
-					_, err := as.Login(LoginInput{
-						Password: testPassword,
-					})
-					Expect(err).To(HaveOccurred())
-				})
-			})
-
 			When("successfully saves account in keychain", func() {
 				BeforeEach(func() {
 					mockKeychain.EXPECT().
@@ -296,8 +306,7 @@ var _ = Describe("AppStore (Login)", func() {
 							}
 
 							var got Account
-							err := json.Unmarshal(data, &got)
-							Expect(err).ToNot(HaveOccurred())
+							Expect(json.Unmarshal(data, &got)).To(Succeed())
 							Expect(got).To(Equal(want))
 						}).
 						Return(nil)

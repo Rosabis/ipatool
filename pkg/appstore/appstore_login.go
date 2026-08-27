@@ -16,6 +16,8 @@ var (
 	ErrAuthCodeRequired = errors.New("auth code is required")
 )
 
+const legacyAuthenticateEndpoint = "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+
 type LoginInput struct {
 	Email    string
 	Password string
@@ -74,11 +76,22 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
 	retry := true
 
 	for attempt := 1; retry && attempt <= 4; attempt++ {
-		request := t.loginRequest(email, password, authCode, guid, endpoint, attempt)
+		requestAttempt := attempt
+		if redirect != "" {
+			// The pod redirect is part of the same authentication attempt. Apple
+			// expects the original XML plist body, including its attempt value.
+			requestAttempt = 1
+		}
+
+		request := t.loginRequest(email, password, authCode, guid, endpoint, requestAttempt)
 		request.URL, _ = util.IfEmpty(redirect, request.URL), ""
 		res, err = t.loginClient.Send(request)
 
 		if err != nil {
+			if shouldRetryWithLegacyAuthenticate(endpoint, err) {
+				return t.login(email, password, authCode, guid, legacyAuthenticateEndpoint)
+			}
+
 			return Account{}, fmt.Errorf("request failed: %w", err)
 		}
 
@@ -125,6 +138,24 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string) (Acco
 	return acc, nil
 }
 
+func shouldRetryWithLegacyAuthenticate(endpoint string, err error) bool {
+	if !strings.Contains(endpoint, "/native/") {
+		return false
+	}
+
+	var responseErr *http.UnexpectedResponseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+
+	switch responseErr.StatusCode {
+	case gohttp.StatusNoContent, gohttp.StatusForbidden, gohttp.StatusNotFound, gohttp.StatusServiceUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int, authCode string) (bool, string, error) {
 	var (
 		retry    bool
@@ -162,7 +193,7 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string, attempt int) http.Request {
 	return http.Request{
 		Method:         http.MethodPOST,
-		URL:            util.IfEmpty(endpoint, fmt.Sprintf("https://%s%s", PrivateAuthDomain, PrivateAuthPathNative)),
+		URL:            authenticateURL(endpoint),
 		ResponseFormat: http.ResponseFormatXML,
 		Headers: map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -178,4 +209,21 @@ func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string
 			},
 		},
 	}
+}
+
+// authenticateURL normalizes the bag-provided authentication endpoint. Apple's
+// current endpoint (https://auth.itunes.apple.com/auth/v1/native/fast) only
+// responds correctly when the path has a trailing slash; without it the request
+// is redirected/dropped and the login silently fails. The legacy MZFinance
+// authenticate endpoint is left untouched.
+func authenticateURL(endpoint string) string {
+	if endpoint == "" {
+		return endpoint
+	}
+
+	if strings.Contains(endpoint, "/native/") && !strings.HasSuffix(endpoint, "/") {
+		return endpoint + "/"
+	}
+
+	return endpoint
 }
