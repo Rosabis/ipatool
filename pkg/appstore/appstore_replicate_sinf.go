@@ -15,8 +15,9 @@ import (
 )
 
 type Sinf struct {
-	ID   int64  `plist:"id,omitempty"`
-	Data []byte `plist:"sinf,omitempty"`
+	ID     int64  `plist:"id,omitempty"`
+	Data   []byte `plist:"sinf,omitempty"`
+	DPInfo []byte `plist:"dpInfo,omitempty"`
 }
 
 type ReplicateSinfInput struct {
@@ -25,23 +26,62 @@ type ReplicateSinfInput struct {
 }
 
 func (t *appstore) ReplicateSinf(input ReplicateSinfInput) error {
+	tmpPath := fmt.Sprintf("%s.tmp", input.PackagePath)
+	if err := t.writeReplicatedZip(input, tmpPath); err != nil {
+		return err
+	}
+
+	if err := t.os.Remove(input.PackagePath); err != nil {
+		return fmt.Errorf("failed to remove original file: %w", err)
+	}
+
+	if err := t.os.Rename(tmpPath, input.PackagePath); err != nil {
+		return fmt.Errorf("failed to rename replicated file: %w", err)
+	}
+
+	return nil
+}
+
+//nolint:nonamedreturns // Deferred cleanup must update the returned error.
+func (t *appstore) writeReplicatedZip(input ReplicateSinfInput, tmpPath string) (err error) {
 	zipReader, err := zip.OpenReader(input.PackagePath)
 	if err != nil {
 		return errors.New("failed to open zip reader")
 	}
 
-	tmpPath := fmt.Sprintf("%s.tmp", input.PackagePath)
-	tmpFile, err := t.os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY, 0644)
+	defer func() {
+		if closeErr := zipReader.Close(); closeErr != nil {
+			err = joinCleanupError(err, "failed to close zip reader", closeErr)
+		}
+	}()
 
+	tmpFile, err := t.os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 
-	zipWriter := zip.NewWriter(tmpFile)
+	defer func() {
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			err = joinCleanupError(err, "failed to close replicated file", closeErr)
+		}
+	}()
 
-	err = t.replicateZip(zipReader, zipWriter)
+	zipWriter := zip.NewWriter(tmpFile)
+	defer func() {
+		if closeErr := zipWriter.Close(); closeErr != nil {
+			err = joinCleanupError(err, "failed to close zip writer", closeErr)
+		}
+	}()
+
+	err = t.replicateZip(zipReader, zipWriter, input.PackagePath)
 	if err != nil {
 		return fmt.Errorf("failed to replicate zip: %w", err)
+	}
+
+	// Device-based downloads can omit sinfs even when the package has a
+	// manifest. Preserve the archive rewrite, but only inject supplied data.
+	if len(input.Sinfs) == 0 {
+		return nil
 	}
 
 	bundleName, err := t.readBundleName(zipReader)
@@ -69,21 +109,16 @@ func (t *appstore) ReplicateSinf(input ReplicateSinfInput) error {
 		return fmt.Errorf("failed to replicate sinf: %w", err)
 	}
 
-	zipReader.Close()
-	zipWriter.Close()
-	tmpFile.Close()
-
-	err = t.os.Remove(input.PackagePath)
-	if err != nil {
-		return fmt.Errorf("failed to remove original file: %w", err)
-	}
-
-	err = t.os.Rename(tmpPath, input.PackagePath)
-	if err != nil {
-		return fmt.Errorf("failed to remove original file: %w", err)
-	}
-
 	return nil
+}
+
+func joinCleanupError(err error, message string, cleanupErr error) error {
+	wrapped := fmt.Errorf("%s: %w", message, cleanupErr)
+	if err == nil {
+		return wrapped
+	}
+
+	return errors.Join(err, wrapped)
 }
 
 type packageManifest struct {
@@ -133,31 +168,59 @@ func (t *appstore) replicateSinfFromInfo(info packageInfo, zip *zip.Writer, sinf
 	return nil
 }
 
-func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer) error {
+func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip headers: %w", err)
+	}
+
+	defer source.Close()
+
+	info, err := source.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat zip: %w", err)
+	}
+
+	headers, err := newZIPLocalHeaders(source, info.Size())
+	if err != nil {
+		return fmt.Errorf("failed to read zip directory: %w", err)
+	}
+
 	for _, file := range src.File {
-		err := func() error {
-			srcFile, err := file.Open()
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer srcFile.Close()
-
-			header := file.FileHeader
-			dstFile, err := dst.CreateHeader(&header)
-
-			if err != nil {
-				return fmt.Errorf("failed to create file: %w", err)
-			}
-
-			_, err = io.Copy(dstFile, srcFile)
-			if err != nil {
-				return fmt.Errorf("failed to copy file: %w", err)
-			}
-
-			return nil
-		}()
+		srcFile, err := file.OpenRaw()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to open file: %w", err)
+		}
+
+		header := file.FileHeader
+
+		localExtra, err := headers.extra(file)
+		if err != nil {
+			return fmt.Errorf("failed to read local metadata for %q: %w", file.Name, err)
+		}
+
+		header.Extra = zipStoredExtra(&header, localExtra)
+		// Frame deflated files with a trailing descriptor for streaming
+		// installers, without changing their compressed data or timestamps.
+		// Stored files need inline sizes because they have no stream terminator.
+		if strings.HasSuffix(header.Name, "/") || header.Method == zip.Store {
+			header.Flags &^= 0x8
+		} else if header.Method == zip.Deflate {
+			header.Flags |= 0x8
+		}
+
+		dstFile, err := dst.CreateRaw(&header)
+		if err != nil {
+			return fmt.Errorf("failed to create file: %w", err)
+		}
+
+		// CreateRaw writes the local header immediately and retains this pointer
+		// for the central directory written by Close. Keep the two extras distinct.
+		header.Extra = zipExtraWithoutZIP64(file.Extra)
+
+		_, err = io.Copy(dstFile, srcFile)
+		if err != nil {
+			return fmt.Errorf("failed to copy file: %w", err)
 		}
 	}
 

@@ -3,18 +3,29 @@ package http
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"howett.net/plist"
 )
 
-const (
-	appStoreAuthURL = "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
-)
+const DefaultAuthenticationTimeout = 30 * time.Second
+
+// IsAuthenticationRedirect reports which Store redirects can replay a signed POST.
+// A 303 explicitly requests a GET and is not part of this authentication flow.
+func IsAuthenticationRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
 
 var (
 	documentXMLPattern = regexp.MustCompile(`(?is)<Document\b[^>]*>(.*)</Document>`)
@@ -31,22 +42,40 @@ type Client[R interface{}] interface {
 }
 
 type client[R interface{}] struct {
-	internalClient http.Client
+	executor       Executor
+	timeout        time.Duration
 	cookieJar      CookieJar
+	authentication bool
 }
 
 type Args struct {
+	Executor  Executor
 	CookieJar CookieJar
+	// Authentication enables allowlisted login diagnostics and its default timeout.
+	// The executor owns connection isolation and redirect handling.
+	Authentication bool
+	// Timeout covers the request and response body. Zero uses the authentication
+	// default for login clients and leaves other clients without an overall limit.
+	Timeout time.Duration
 }
 
 // UnexpectedResponseError preserves the HTTP status when Apple returns an
 // HTML or empty response where an XML plist was expected.
 type UnexpectedResponseError struct {
-	StatusCode int
-	Snippet    string
+	StatusCode    int
+	Snippet       string
+	Reason        string
+	BodyLength    int
+	ContentType   string
+	CorrelationID string
+	RetryAfter    string
 }
 
 func (e *UnexpectedResponseError) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("unexpected response from Apple (HTTP %d): %s (body length=%d, content type=%q, correlation ID=%q)", e.StatusCode, e.Reason, e.BodyLength, e.ContentType, e.CorrelationID)
+	}
+
 	if e.Snippet == "" {
 		return fmt.Sprintf("unexpected response from Apple (HTTP %d): empty or non-plist body", e.StatusCode)
 	}
@@ -54,76 +83,54 @@ func (e *UnexpectedResponseError) Error() string {
 	return fmt.Sprintf("unexpected response from Apple (HTTP %d): %s", e.StatusCode, e.Snippet)
 }
 
-type AddHeaderTransport struct {
-	T http.RoundTripper
-}
-
-func (t *AddHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", DefaultUserAgent)
-	}
-
-	res, err := t.T.RoundTrip(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make round trip: %w", err)
-	}
-
-	return res, nil
-}
-
+// NewClient creates a typed response adapter. Requests require an explicit
+// executor; production Store clients always supply the framework backend.
 func NewClient[R interface{}](args Args) Client[R] {
-	return &client[R]{
-		internalClient: http.Client{
-			Timeout: 0,
-			Jar:     args.CookieJar,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if req.Referer() == appStoreAuthURL {
-					return http.ErrUseLastResponse
-				}
-
-				return nil
-			},
-			Transport: &AddHeaderTransport{http.DefaultTransport},
-		},
-		cookieJar: args.CookieJar,
+	timeout := args.Timeout
+	if args.Authentication && timeout == 0 {
+		timeout = DefaultAuthenticationTimeout
 	}
+
+	return &client[R]{executor: args.Executor, timeout: timeout, cookieJar: args.CookieJar, authentication: args.Authentication}
 }
 
 func (c *client[R]) Send(req Request) (Result[R], error) {
-	var (
-		data []byte
-		err  error
-	)
-
-	if req.Payload != nil {
-		data, err = req.Payload.data()
-		if err != nil {
-			return Result[R]{}, fmt.Errorf("failed to get payload data: %w", err)
-		}
+	var data []byte
+	if payload, ok := req.Payload.(*RawPayload); ok {
+		data = bytes.Clone(payload.Content)
 	}
 
-	request, err := http.NewRequest(req.Method, req.URL, bytes.NewReader(data))
+	if c.executor == nil {
+		return Result[R]{}, errors.New("request executor is not configured")
+	}
+
+	req.Timeout = c.timeout
+	res, err := c.executor.Send(req, data)
+
 	if err != nil {
-		return Result[R]{}, fmt.Errorf("failed to create request: %w", err)
+		return Result[R]{}, fmt.Errorf("request failed: %w", &TransportError{Err: err})
 	}
 
-	for key, val := range req.Headers {
-		request.Header.Set(key, val)
+	if res == nil || res.Body == nil {
+		return Result[R]{}, errors.New("request returned no HTTP response")
 	}
 
-	res, err := c.internalClient.Do(request)
-	if err != nil {
-		return Result[R]{}, fmt.Errorf("request failed: %w", err)
-	}
 	defer res.Body.Close()
 
-	err = c.cookieJar.Save()
+	if c.cookieJar != nil {
+		err = c.cookieJar.Save()
+	}
+
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to save cookies: %w", err)
 	}
 
 	if req.ResponseFormat == ResponseFormatJSON {
 		return c.handleJSONResponse(res)
+	}
+
+	if req.ResponseFormat == ResponseFormatRaw {
+		return c.handleRawResponse(res)
 	}
 
 	if req.ResponseFormat == ResponseFormatXML {
@@ -133,8 +140,30 @@ func (c *client[R]) Send(req Request) (Result[R], error) {
 	return Result[R]{}, fmt.Errorf("content type is not supported (%s)", req.ResponseFormat)
 }
 
+func (c *client[R]) handleRawResponse(res *http.Response) (Result[R], error) {
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
+	}
+
+	data, ok := any(body).(R)
+	if !ok {
+		return Result[R]{}, errors.New("raw response format requires a []byte result type")
+	}
+
+	return Result[R]{
+		StatusCode: res.StatusCode,
+		Headers:    responseHeaders(res),
+		Data:       data,
+	}, nil
+}
+
 func (c *client[R]) Do(req *http.Request) (*http.Response, error) {
-	res, err := c.internalClient.Do(req)
+	if c.executor == nil {
+		return nil, errors.New("request executor is not configured")
+	}
+
+	res, err := c.executor.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("received error: %w", err)
 	}
@@ -154,7 +183,7 @@ func (*client[R]) NewRequest(method, url string, body io.Reader) (*http.Request,
 func (c *client[R]) handleJSONResponse(res *http.Response) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
+		return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
 	}
 
 	var data R
@@ -173,10 +202,14 @@ func (c *client[R]) handleJSONResponse(res *http.Response) (Result[R], error) {
 func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
+		return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
 	}
 
-	if res.StatusCode == http.StatusTooManyRequests {
+	if c.authentication && IsAuthenticationRedirect(res.StatusCode) && strings.TrimSpace(res.Header.Get("Location")) == "" {
+		return Result[R]{}, authenticationResponseError(res, body, "authentication redirect is missing Location")
+	}
+
+	if !c.authentication && res.StatusCode == http.StatusTooManyRequests {
 		return Result[R]{}, fmt.Errorf("rate limited by Apple (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -195,6 +228,14 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 	normalizedBody := normalizeXMLPlistBody(body)
 
 	if !looksLikePropertyList(normalizedBody) {
+		if c.authentication {
+			if res.StatusCode == http.StatusTooManyRequests {
+				return Result[R]{}, authenticationResponseError(res, body, "rate limited by Apple")
+			}
+
+			return Result[R]{}, authenticationResponseError(res, body, "empty or non-plist authentication response")
+		}
+
 		snippet := bodySnippet(body)
 
 		return Result[R]{}, &UnexpectedResponseError{
@@ -205,6 +246,10 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 
 	_, err = plist.Unmarshal(normalizedBody, &data)
 	if err != nil {
+		if c.authentication {
+			return Result[R]{}, authenticationResponseError(res, body, "malformed authentication plist")
+		}
+
 		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w", err)
 	}
 
@@ -213,6 +258,16 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 		Headers:    responseHeaders(res),
 		Data:       data,
 	}, nil
+}
+
+// DecodePropertyList accepts the legacy XML envelope used by Apple's URL bag.
+// The framework backend uses the same normalization as the typed HTTP client.
+func DecodePropertyList(data []byte, value any) error {
+	if _, err := plist.Unmarshal(normalizeXMLPlistBody(data), value); err != nil {
+		return fmt.Errorf("decode Apple property list: %w", err)
+	}
+
+	return nil
 }
 
 func responseHeaders(res *http.Response) map[string]string {
@@ -324,4 +379,17 @@ func extractDocumentInnerBody(body []byte) []byte {
 	}
 
 	return documentBody
+}
+
+// Do not retain bodies or arbitrary response headers: authentication responses
+// can contain credentials, tokens and cookies, including on failure.
+func authenticationResponseError(res *http.Response, body []byte, reason string) *UnexpectedResponseError {
+	return &UnexpectedResponseError{
+		StatusCode:    res.StatusCode,
+		Reason:        reason,
+		BodyLength:    len(body),
+		ContentType:   bodySnippet([]byte(res.Header.Get("Content-Type"))),
+		CorrelationID: bodySnippet([]byte(res.Header.Get("X-Apple-Jingle-Correlation-Key"))),
+		RetryAfter:    res.Header.Get("Retry-After"),
+	}
 }

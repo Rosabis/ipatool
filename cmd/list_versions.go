@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -13,16 +12,22 @@ import (
 // nolint:wrapcheck
 func ListVersionsCmd() *cobra.Command {
 	var (
-		appID    int64
-		bundleID string
+		appID         int64
+		bundleID      string
+		platformValue string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "list-versions",
-		Short: "List the available versions of an iOS app",
+		Short: "List the available versions of an App Store app",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if appID == 0 && bundleID == "" {
 				return errors.New("either the app ID or the bundle identifier must be specified")
+			}
+
+			platform, err := appstore.ParsePlatform(platformValue)
+			if err != nil {
+				return err
 			}
 
 			var lastErr error
@@ -37,15 +42,9 @@ func ListVersionsCmd() *cobra.Command {
 				acc = infoResult.Account
 
 				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					bagOutput, err := dependencies.AppStore.Bag(appstore.BagInput{})
-					if err != nil {
-						return fmt.Errorf("failed to get bag: %w", err)
-					}
-
 					loginResult, err := dependencies.AppStore.Login(appstore.LoginInput{
 						Email:    acc.Email,
 						Password: acc.Password,
-						Endpoint: bagOutput.AuthEndpoint,
 					})
 					if err != nil {
 						return err
@@ -56,7 +55,7 @@ func ListVersionsCmd() *cobra.Command {
 
 				app := appstore.App{ID: appID}
 				if bundleID != "" {
-					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID})
+					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
 					if err != nil {
 						return err
 					}
@@ -64,7 +63,7 @@ func ListVersionsCmd() *cobra.Command {
 					app = lookupResult.App
 				}
 
-				out, err := dependencies.AppStore.ListVersions(appstore.ListVersionsInput{Account: acc, App: app})
+				out, err := dependencies.AppStore.ListVersions(appstore.ListVersionsInput{Context: cmd.Context(), Account: acc, App: app, Platform: platform})
 				if err != nil {
 					return err
 				}
@@ -90,8 +89,10 @@ func ListVersionsCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target iOS app (required)")
-	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target iOS app (overrides the app ID)")
+	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target app (required)")
+	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target app (overrides the app ID)")
+
+	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to list versions for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
 
 	return cmd
 }

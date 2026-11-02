@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"time"
 
@@ -14,6 +13,11 @@ import (
 
 // nolint:wrapcheck
 func downloadCmd() *cobra.Command {
+	return downloadCmdWithAppStore(func() appstore.AppStore { return dependencies.AppStore })
+}
+
+//nolint:wrapcheck
+func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	var (
 		acquireLicense    bool
 		outputPath        string
@@ -25,34 +29,33 @@ func downloadCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "download",
-		Short: "Download (encrypted) iOS and tvOS app packages from the App Store",
+		Short: "Download iOS, iPadOS, tvOS, watchOS, visionOS, and macOS app packages from the App Store",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if appID == 0 && bundleID == "" {
 				return errors.New("either the app ID or the bundle identifier must be specified")
 			}
 
+			platform, err := appstore.ParsePlatform(platformValue)
+			if err != nil {
+				return err
+			}
+
+			store := appStore()
+			infoResult, err := store.AccountInfo()
+			if err != nil {
+				return err
+			}
+
+			acc := infoResult.Account
 			var lastErr error
-			var acc appstore.Account
+			purchaseRequired := false
 			purchased := false
 
 			return retry.Do(func() error {
-				infoResult, err := dependencies.AppStore.AccountInfo()
-				if err != nil {
-					return err
-				}
-
-				acc = infoResult.Account
-
 				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					bagOutput, err := dependencies.AppStore.Bag(appstore.BagInput{})
-					if err != nil {
-						return fmt.Errorf("failed to get bag: %w", err)
-					}
-
-					loginResult, err := dependencies.AppStore.Login(appstore.LoginInput{
+					loginResult, err := store.Login(appstore.LoginInput{
 						Email:    acc.Email,
 						Password: acc.Password,
-						Endpoint: bagOutput.AuthEndpoint,
 					})
 					if err != nil {
 						return err
@@ -61,30 +64,38 @@ func downloadCmd() *cobra.Command {
 					acc = loginResult.Account
 				}
 
-				app := appstore.App{ID: appID}
-				platform, err := appstore.ParsePlatform(platformValue)
-				if err != nil {
-					return err
-				}
+				app := appstore.App{ID: appID, BundleID: bundleID}
 
 				if bundleID != "" {
-					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{
+					lookupResult, err := store.Lookup(appstore.LookupInput{
 						Account:  acc,
 						BundleID: bundleID,
 						Platform: platform,
 					})
-					if err != nil {
+					if err != nil && (appID == 0 || !errors.Is(err, appstore.ErrAppNotFound)) {
 						return err
 					}
 
-					app = lookupResult.App
+					// Delisted apps may still be downloadable by their numeric ID.
+					if err == nil {
+						app = lookupResult.App
+					}
 				}
 
 				if errors.Is(lastErr, appstore.ErrLicenseRequired) {
-					err := dependencies.AppStore.Purchase(appstore.PurchaseInput{Account: acc, App: app})
+					purchaseRequired = true
+				}
+
+				if purchaseRequired {
+					err := store.Purchase(appstore.PurchaseInput{
+						Account:  acc,
+						App:      app,
+						Platform: platform,
+					})
 					if err != nil && !errors.Is(err, appstore.ErrLicenseAlreadyExists) {
 						return err
 					}
+					purchaseRequired = false
 					purchased = true
 					dependencies.Logger.Verbose().
 						Bool("success", true).
@@ -110,7 +121,8 @@ func downloadCmd() *cobra.Command {
 					)
 				}
 
-				out, err := dependencies.AppStore.Download(appstore.DownloadInput{
+				out, err := store.Download(appstore.DownloadInput{
+					Context:           cmd.Context(),
 					Account:           acc,
 					App:               app,
 					OutputPath:        outputPath,
@@ -122,8 +134,7 @@ func downloadCmd() *cobra.Command {
 					return err
 				}
 
-				err = dependencies.AppStore.ReplicateSinf(appstore.ReplicateSinfInput{Sinfs: out.Sinfs, PackagePath: out.DestinationPath})
-				if err != nil {
+				if err := replicateDownloadSinf(store, platform, out); err != nil {
 					return err
 				}
 
@@ -156,12 +167,25 @@ func downloadCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target iOS app (required)")
-	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target iOS app (overrides the app ID)")
+	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target app (required)")
+	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target app (overrides the app ID when found)")
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "The destination path of the downloaded app package")
-	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target iOS app (defaults to latest version when not specified)")
-	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to download for: iphone, ipad, or appletv")
+	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target app (defaults to latest version when not specified)")
+	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to download for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
 	cmd.Flags().BoolVar(&acquireLicense, "purchase", false, "Obtain a license for the app if needed")
 
 	return cmd
+}
+
+type sinfReplicator interface {
+	ReplicateSinf(input appstore.ReplicateSinfInput) error
+}
+
+//nolint:wrapcheck
+func replicateDownloadSinf(store sinfReplicator, platform appstore.Platform, out appstore.DownloadOutput) error {
+	if platform == appstore.PlatformMacOS && len(out.Sinfs) == 0 {
+		return nil
+	}
+
+	return store.ReplicateSinf(appstore.ReplicateSinfInput{Sinfs: out.Sinfs, PackagePath: out.DestinationPath})
 }

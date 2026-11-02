@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -16,6 +15,7 @@ func getVersionMetadataCmd() *cobra.Command {
 		appID             int64
 		bundleID          string
 		externalVersionID string
+		platformValue     string
 	)
 
 	cmd := &cobra.Command{
@@ -24,6 +24,11 @@ func getVersionMetadataCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if appID == 0 && bundleID == "" {
 				return errors.New("either the app ID or the bundle identifier must be specified")
+			}
+
+			platform, err := appstore.ParsePlatform(platformValue)
+			if err != nil {
+				return err
 			}
 
 			var lastErr error
@@ -38,15 +43,9 @@ func getVersionMetadataCmd() *cobra.Command {
 				acc = infoResult.Account
 
 				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					bagOutput, err := dependencies.AppStore.Bag(appstore.BagInput{})
-					if err != nil {
-						return fmt.Errorf("failed to get bag: %w", err)
-					}
-
 					loginResult, err := dependencies.AppStore.Login(appstore.LoginInput{
 						Email:    acc.Email,
 						Password: acc.Password,
-						Endpoint: bagOutput.AuthEndpoint,
 					})
 					if err != nil {
 						return err
@@ -57,7 +56,7 @@ func getVersionMetadataCmd() *cobra.Command {
 
 				app := appstore.App{ID: appID}
 				if bundleID != "" {
-					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID})
+					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
 					if err != nil {
 						return err
 					}
@@ -66,9 +65,11 @@ func getVersionMetadataCmd() *cobra.Command {
 				}
 
 				out, err := dependencies.AppStore.GetVersionMetadata(appstore.GetVersionMetadataInput{
+					Context:   cmd.Context(),
 					Account:   acc,
 					App:       app,
 					VersionID: externalVersionID,
+					Platform:  platform,
 				})
 				if err != nil {
 					return err
@@ -96,9 +97,11 @@ func getVersionMetadataCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target iOS app (required)")
-	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target iOS app (overrides the app ID)")
-	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target iOS app (required)")
+	cmd.Flags().Int64VarP(&appID, "app-id", "i", 0, "ID of the target app (required)")
+	cmd.Flags().StringVarP(&bundleID, "bundle-identifier", "b", "", "The bundle identifier of the target app (overrides the app ID)")
+	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target app (required)")
+
+	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to retrieve metadata for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
 
 	_ = cmd.MarkFlagRequired("external-version-id")
 

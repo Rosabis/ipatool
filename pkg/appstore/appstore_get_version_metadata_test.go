@@ -154,7 +154,7 @@ var _ = Describe("HTTPRangeReaderAt", func() {
 		server, _, _ := testIPAServerWithRangeLog(data, &rangeLog)
 		defer server.Close()
 
-		reader, size, err := newHTTPRangeReaderAt(http.NewClient[interface{}](http.Args{}), server.URL)
+		reader, size, err := newHTTPRangeReaderAt(newDownloadTestClient(), server.URL)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(size).To(Equal(int64(len(data))))
 
@@ -171,6 +171,7 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 	var (
 		ctrl               *gomock.Controller
 		mockMachine        *machine.MockMachine
+		mockBagClient      *http.MockClient[bagResult]
 		mockDownloadClient *http.MockClient[downloadResult]
 		as                 AppStore
 	)
@@ -178,11 +179,13 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockMachine = machine.NewMockMachine(ctrl)
+		mockBagClient = http.NewMockClient[bagResult](ctrl)
 		mockDownloadClient = http.NewMockClient[downloadResult](ctrl)
 		as = &appstore{
 			machine:        mockMachine,
+			bagClient:      mockBagClient,
 			downloadClient: mockDownloadClient,
-			httpClient:     http.NewClient[interface{}](http.Args{}),
+			httpClient:     newDownloadTestClient(),
 		}
 	})
 
@@ -370,9 +373,17 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 			mockDownloadClient.EXPECT().
 				Send(gomock.Any()).
 				Return(http.Result[downloadResult]{
+					StatusCode: gohttp.StatusOK,
 					Data: downloadResult{
 						Items: []downloadItemResult{},
 					},
+				}, nil)
+
+			mockBagClient.EXPECT().
+				Send(gomock.Any()).
+				Return(http.Result[bagResult]{
+					StatusCode: gohttp.StatusOK,
+					Data:       validBagResult(),
 				}, nil)
 		})
 
@@ -462,6 +473,41 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 		})
 	})
 
+	It("preserves the requested historical version through the redownload fallback", func() {
+		const versionID = "818970197"
+		releaseDate := time.Date(2016, 12, 15, 12, 0, 0, 0, time.UTC)
+		server, _, _ := testIPAServer(testIPA("1.0", releaseDate.Format(time.RFC3339), releaseDate))
+		defer server.Close()
+
+		bag := validBagResult()
+		bag.URLBag.RedownloadEndpoint = testRedownloadEndpoint
+		mockMachine.EXPECT().MacAddress().Return("00:11:22:33:44:55", nil)
+		gomock.InOrder(
+			mockDownloadClient.EXPECT().Send(gomock.Any()).
+				Do(func(req http.Request) {
+					Expect(req.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("externalVersionId", versionID))
+				}).
+				Return(http.Result[downloadResult]{StatusCode: gohttp.StatusOK}, nil),
+			mockBagClient.EXPECT().Send(gomock.Any()).
+				Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
+			mockDownloadClient.EXPECT().Send(gomock.Any()).
+				Do(func(req http.Request) {
+					payload := req.Payload.(*http.XMLPayload).Content
+					Expect(payload).To(HaveKeyWithValue("appExtVrsId", versionID))
+					Expect(payload).ToNot(HaveKey("externalVersionId"))
+				}).
+				Return(http.Result[downloadResult]{StatusCode: gohttp.StatusOK,
+					Data: downloadResult{Items: []downloadItemResult{{URL: server.URL}}}}, nil),
+		)
+
+		output, err := as.GetVersionMetadata(GetVersionMetadataInput{
+			App: App{ID: 547702041}, VersionID: versionID,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.DisplayVersion).To(Equal("1.0"))
+		Expect(output.ReleaseDate).To(Equal(releaseDate))
+	})
+
 	When("successfully gets version metadata", func() {
 		var (
 			server         *httptest.Server
@@ -503,7 +549,7 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 			server.Close()
 		})
 
-		It("returns version metadata", func() {
+		DescribeTable("returns version metadata", func(platform Platform) {
 			output, err := as.GetVersionMetadata(GetVersionMetadataInput{
 				Account: Account{
 					DirectoryServicesID: "test-dsid",
@@ -512,6 +558,7 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 					ID: 1234567890,
 				},
 				VersionID: "test-version",
+				Platform:  platform,
 			})
 
 			Expect(err).NotTo(HaveOccurred())
@@ -519,6 +566,9 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 			Expect(output.ReleaseDate).To(Equal(releaseDate))
 			Expect(atomic.LoadInt64(wholeGetCount)).To(BeZero())
 			Expect(atomic.LoadInt64(servedBytes)).To(BeNumerically("<", int64(len(ipa)/2)))
-		})
+		},
+			Entry("default platform", Platform("")),
+			Entry("watchOS", PlatformWatchOS),
+		)
 	})
 })

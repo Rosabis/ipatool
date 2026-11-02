@@ -23,11 +23,14 @@ const (
 	PrivateInitPath   = "/bag.xml"
 
 	PrivateAppStoreAPIDomain       = "buy." + iTunesAPIDomain
+	PrivateAppStoreAPIPathAuth     = "/WebObjects/MZFinance.woa/wa/authenticate"
 	PrivateAppStoreAPIPathPurchase = "/WebObjects/MZFinance.woa/wa/buyProduct"
 	PrivateAppStoreAPIPathDownload = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct"
 
 	PrivateAuthDomain     = "auth." + iTunesAPIDomain
 	PrivateAuthPathNative = "/auth/v1/native/fast/"
+
+	PrivatePurchaseDAAPBaseURL = "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase"
 
 	HTTPHeaderStoreFront = "X-Set-Apple-Store-Front"
 	HTTPHeaderPod        = "pod"

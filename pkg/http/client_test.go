@@ -1,259 +1,127 @@
 package http
 
 import (
+	"bytes"
+	"context"
 	"errors"
-	"net/http"
+	"io"
+	gohttp "net/http"
 	"net/http/httptest"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 )
 
-var _ = Describe("Client", Ordered, func() {
-	type jsonResult struct {
-		Foo string `json:"foo"`
+var _ = Describe("Typed response client", func() {
+	type result struct {
+		Foo string `json:"foo" plist:"foo"`
 	}
-
-	type xmlResult struct {
-		Foo string `plist:"foo"`
-	}
-
-	var (
-		ctrl          *gomock.Controller
-		srv           *httptest.Server
-		mockHandler   func(w http.ResponseWriter, r *http.Request)
-		mockCookieJar *MockCookieJar
-	)
-
-	BeforeAll(func() {
-		ctrl = gomock.NewController(GinkgoT())
-		mockCookieJar = NewMockCookieJar(ctrl)
-		mockHandler = func(w http.ResponseWriter, r *http.Request) {}
-		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mockHandler(w, r)
-		}))
-	})
-
-	BeforeEach(func() {
-		mockCookieJar.EXPECT().
-			Cookies(gomock.Any()).
-			Return(nil).
-			MaxTimes(1)
-	})
-
-	It("returns request", func() {
-		sut := NewClient[xmlResult](Args{})
-
-		req, err := sut.NewRequest("GET", srv.URL, nil)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(req).ToNot(BeNil())
-	})
-
-	It("returns response", func() {
-		mockHandler = func(_w http.ResponseWriter, r *http.Request) {
-			defer GinkgoRecover()
-			Expect(r.Header.Get("User-Agent")).To(Equal(DefaultUserAgent))
-		}
-
-		sut := NewClient[xmlResult](Args{})
-
-		req, err := sut.NewRequest("GET", srv.URL, nil)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(req).ToNot(BeNil())
-
-		res, err := sut.Do(req)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(res).ToNot(BeNil())
-	})
-
-	When("payload decodes successfully", func() {
-		When("cookie jar fails to save", func() {
-			BeforeEach(func() {
-				mockCookieJar.EXPECT().
-					Save().
-					Return(errors.New(""))
-			})
-
-			It("returns error", func() {
-				sut := NewClient[jsonResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				_, err := sut.Send(Request{
-					URL:    srv.URL,
-					Method: MethodGET,
-				})
-
-				Expect(err).To(HaveOccurred())
-			})
-		})
-
-		When("cookie jar saves new cookies", func() {
-			BeforeEach(func() {
-				mockCookieJar.EXPECT().
-					Save().
-					Return(nil)
-			})
-
-			It("decodes JSON response", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "application/json")
-					_, err := w.Write([]byte("{\"foo\":\"bar\"}"))
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				sut := NewClient[jsonResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				res, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodGET,
-					ResponseFormat: ResponseFormatJSON,
-					Headers: map[string]string{
-						"foo": "bar",
-					},
-					Payload: &URLPayload{
-						Content: map[string]interface{}{
-							"data": "test",
-						},
-					},
-				})
-
-				Expect(err).ToNot(HaveOccurred())
-				Expect(res.Data.Foo).To(Equal("bar"))
-			})
-
-			It("decodes XML response", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "application/xml")
-					_, err := w.Write([]byte("<dict><key>foo</key><string>bar</string></dict>"))
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				sut := NewClient[xmlResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				res, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodPOST,
-					ResponseFormat: ResponseFormatXML,
-				})
-
-				Expect(err).ToNot(HaveOccurred())
-				Expect(res.Data.Foo).To(Equal("bar"))
-			})
-
-			It("decodes XML response wrapped in an Apple Document envelope", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "application/xml")
-					_, err := w.Write([]byte("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<Document xmlns=\"http://www.apple.com/itms/\"><key>foo</key><string>bar</string></Document>"))
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				sut := NewClient[xmlResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				res, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodPOST,
-					ResponseFormat: ResponseFormatXML,
-				})
-
-				Expect(err).ToNot(HaveOccurred())
-				Expect(res.Data.Foo).To(Equal("bar"))
-			})
-
-			It("decodes XML response wrapped in Document/Protocol/plist with nested dict", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "application/xml")
-					_, err := w.Write([]byte("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<Document xmlns=\"http://www.apple.com/itms/\"><Protocol><plist version=\"1.0\"><dict><key>nested</key><dict><key>a</key><string>b</string></dict><key>foo</key><string>bar</string></dict></plist></Protocol></Document>"))
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				sut := NewClient[xmlResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				res, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodPOST,
-					ResponseFormat: ResponseFormatXML,
-				})
-
-				Expect(err).ToNot(HaveOccurred())
-				Expect(res.Data.Foo).To(Equal("bar"))
-			})
-
-			It("returns a readable error when Apple responds with an HTML page instead of a plist", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "text/html")
-					w.WriteHeader(http.StatusServiceUnavailable)
-					_, err := w.Write([]byte("<html><body><h1>Service Unavailable</h1></body></html>"))
-					Expect(err).ToNot(HaveOccurred())
-				}
-
-				sut := NewClient[xmlResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				_, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodPOST,
-					ResponseFormat: ResponseFormatXML,
-				})
-
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).ToNot(ContainSubstring("hex digit"))
-				Expect(err.Error()).To(ContainSubstring("Service Unavailable"))
-			})
-
-			It("returns error when content type is not supported", func() {
-				mockHandler = func(w http.ResponseWriter, _r *http.Request) {
-					w.Header().Add("Content-Type", "application/xyz")
-				}
-
-				sut := NewClient[xmlResult](Args{
-					CookieJar: mockCookieJar,
-				})
-				_, err := sut.Send(Request{
-					URL:            srv.URL,
-					Method:         MethodPOST,
-					ResponseFormat: "random",
-				})
-
-				Expect(err).To(HaveOccurred())
-			})
-		})
-	})
-
-	It("preserves an XML redirect response and its location header", func() {
+	response := func(body string) *gohttp.Response {
 		recorder := httptest.NewRecorder()
-		recorder.Header().Set("Location", "https://p7-buy.itunes.apple.com/authenticate")
-		recorder.WriteHeader(http.StatusFound)
+		_, err := recorder.WriteString(body)
+		Expect(err).NotTo(HaveOccurred())
 
-		sut := &client[xmlResult]{}
-		res, err := sut.handleXMLResponse(recorder.Result())
-
-		Expect(err).ToNot(HaveOccurred())
-		Expect(res.StatusCode).To(Equal(http.StatusFound))
-		Expect(res.Headers).To(HaveKeyWithValue("Location", "https://p7-buy.itunes.apple.com/authenticate"))
+		return recorder.Result()
+	}
+	It("requires an executor instead of falling back to direct networking", func() {
+		client := NewClient[result](Args{})
+		_, err := client.Send(Request{URL: "https://example.invalid", Method: MethodGET})
+		Expect(err).To(MatchError("request executor is not configured"))
+		req, err := client.NewRequest(MethodGET, "https://example.invalid", nil)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = client.Do(req)
+		Expect(err).To(MatchError("request executor is not configured"))
 	})
+	DescribeTable("decodes framework responses", func(format ResponseFormat, body string) {
+		client := NewClient[result](Args{Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) { return response(body), nil }}})
+		got, err := client.Send(Request{ResponseFormat: format})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Data.Foo).To(Equal("bar"))
+	},
+		Entry("JSON", ResponseFormatJSON, `{"foo":"bar"}`),
+		Entry("plist", ResponseFormatXML, `<plist><dict><key>foo</key><string>bar</string></dict></plist>`),
+		Entry("Document", ResponseFormatXML, `<Document><dict><key>foo</key><string>bar</string></dict></Document>`),
+		Entry("nested Document", ResponseFormatXML, `<Document><Protocol><plist><dict><key>foo</key><string>bar</string></dict></plist></Protocol></Document>`),
+	)
+	It("preserves raw bytes and response headers", func() {
+		client := NewClient[[]byte](Args{Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) {
+			res := response(string([]byte{0, 1, 255}))
+			res.Header.Set("X-Test", "fixture")
 
-	When("payload fails to decode", func() {
-		It("returns error", func() {
-			sut := NewClient[xmlResult](Args{
-				CookieJar: mockCookieJar,
-			})
-			_, err := sut.Send(Request{
-				URL:            srv.URL,
-				Method:         MethodPOST,
-				ResponseFormat: ResponseFormatXML,
-				Payload: &URLPayload{
-					Content: map[string]interface{}{
-						"data": func() {},
-					},
-				},
-			})
+			return res, nil
+		}}})
+		got, err := client.Send(Request{ResponseFormat: ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Data).To(Equal([]byte{0, 1, 255}))
+		Expect(got.GetHeader("x-test")).To(Equal("fixture"))
+	})
+	It("copies raw request data and delegates context, headers, and redirect policy", func() {
+		payload := &RawPayload{Content: []byte{0, 1, 255}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := NewClient[[]byte](Args{Executor: testExecutor{send: func(req Request, body []byte) (*gohttp.Response, error) {
+			Expect(req.Context).To(BeIdenticalTo(ctx))
+			Expect(req.NoRedirects).To(BeTrue())
+			Expect(req.Headers).To(HaveKeyWithValue("X-Token", "fixture"))
+			Expect(body).To(Equal(payload.Content))
+			body[0] = 99
 
-			Expect(err).To(HaveOccurred())
-		})
+			return response("ok"), nil
+		}}})
+		_, err := client.Send(Request{Context: ctx, NoRedirects: true, Headers: map[string]string{"X-Token": "fixture"}, Payload: payload, ResponseFormat: ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(payload.Content).To(Equal([]byte{0, 1, 255}))
+	})
+	DescribeTable("forwards configured timeouts", func(args Args, want time.Duration) {
+		args.Executor = testExecutor{send: func(req Request, _ []byte) (*gohttp.Response, error) {
+			Expect(req.Timeout).To(Equal(want))
+
+			return response("ok"), nil
+		}}
+		_, err := NewClient[[]byte](args).Send(Request{ResponseFormat: ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+	}, Entry("authentication default", Args{Authentication: true}, 30*time.Second), Entry("override", Args{Authentication: true, Timeout: 5 * time.Second}, 5*time.Second), Entry("bag", Args{Timeout: DefaultAuthenticationTimeout}, 30*time.Second), Entry("unlimited transfer", Args{}, time.Duration(0)))
+	It("saves cookies and preserves local storage failures", func() {
+		jar := NewMockCookieJar(gomock.NewController(GinkgoT()))
+		jar.EXPECT().Save().Return(context.DeadlineExceeded)
+		client := NewClient[result](Args{CookieJar: jar, Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) { return response("<dict/>"), nil }}})
+		_, err := client.Send(Request{ResponseFormat: ResponseFormatXML})
+		Expect(errors.Is(err, context.DeadlineExceeded)).To(BeTrue())
+		var transport *TransportError
+		Expect(errors.As(err, &transport)).To(BeFalse())
+	})
+	It("closes response bodies after decoding", func() {
+		body := &trackedResponseBody{Reader: bytes.NewReader([]byte(`{"foo":"bar"}`))}
+		client := NewClient[result](Args{Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) {
+			return &gohttp.Response{StatusCode: 200, Header: make(gohttp.Header), Body: body}, nil
+		}}})
+		_, err := client.Send(Request{ResponseFormat: ResponseFormatJSON})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(body.closed).To(BeTrue())
+	})
+	It("rejects absent executor responses", func() {
+		client := NewClient[result](Args{Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) { return nil, nil }}})
+		_, err := client.Send(Request{})
+		Expect(err).To(MatchError("request returned no HTTP response"))
+	})
+	It("rejects incompatible raw result types and unsupported formats", func() {
+		client := NewClient[result](Args{Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) { return response("body"), nil }}})
+		_, err := client.Send(Request{ResponseFormat: ResponseFormatRaw})
+		Expect(err).To(HaveOccurred())
+		_, err = client.Send(Request{})
+		Expect(err).To(MatchError("content type is not supported ()"))
 	})
 })
+
+type trackedResponseBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackedResponseBody) Close() error {
+	b.closed = true
+
+	return nil
+}

@@ -1,18 +1,13 @@
 package cmd
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
 	"github.com/majd/ipatool/v2/pkg/appstore"
-	"github.com/majd/ipatool/v2/pkg/util"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 func authCmd() *cobra.Command {
@@ -29,18 +24,6 @@ func authCmd() *cobra.Command {
 }
 
 func loginCmd() *cobra.Command {
-	promptForAuthCode := func() (string, error) {
-		authCode, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil {
-			return "", fmt.Errorf("failed to read string: %w", err)
-		}
-
-		authCode = strings.Trim(authCode, "\n")
-		authCode = strings.Trim(authCode, "\r")
-
-		return authCode, nil
-	}
-
 	var email, password, authCode string
 
 	cmd := &cobra.Command{
@@ -49,50 +32,53 @@ func loginCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			interactive := cmd.Context().Value(interactiveKey).(bool)
 
+			if email == "" && !interactive {
+				return errors.New("an Apple ID is required when not running in interactive mode; use the \"--email\" flag")
+			}
+
+			if email == "" && interactive {
+				value, err := readPrompt("enter Apple ID (email address or phone number): ", false)
+				if err != nil {
+					return fmt.Errorf("failed to read Apple ID: %w", err)
+				}
+				email = value
+			}
+
 			if password == "" && !interactive {
 				return errors.New("password is required when not running in interactive mode; use the \"--password\" flag")
 			}
 
 			if password == "" && interactive {
-				dependencies.Logger.Log().Msg("enter password:")
-
-				bytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+				value, err := readPrompt("enter password: ", true)
 				if err != nil {
 					return fmt.Errorf("failed to read password: %w", err)
 				}
-				password = string(bytes)
+				password = value
 			}
+
+			dependencies.Logger.Log().Msg("preparing authentication; the first login may take a few minutes")
 
 			var lastErr error
 
 			// nolint:wrapcheck
 			return retry.Do(func() error {
 				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
-					dependencies.Logger.Log().Msg("enter 2FA code:")
-
 					var err error
-					authCode, err = promptForAuthCode()
+					authCode, err = readPrompt("enter 2FA code: ", false)
 					if err != nil {
 						return fmt.Errorf("failed to read auth code: %w", err)
 					}
 				}
 
 				dependencies.Logger.Verbose().
-					Str("password", password).
 					Str("email", email).
-					Str("authCode", util.IfEmpty(authCode, "<nil>")).
+					Bool("authCodeProvided", authCode != "").
 					Msg("logging in")
-
-				bag, err := dependencies.AppStore.Bag(appstore.BagInput{})
-				if err != nil {
-					return fmt.Errorf("failed to get bag: %w", err)
-				}
 
 				output, err := dependencies.AppStore.Login(appstore.LoginInput{
 					Email:    email,
 					Password: password,
 					AuthCode: authCode,
-					Endpoint: bag.AuthEndpoint,
 				})
 				if err != nil {
 					if errors.Is(err, appstore.ErrAuthCodeRequired) && !interactive {
@@ -125,11 +111,9 @@ func loginCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&email, "email", "e", "", "email address for the Apple ID (required)")
+	cmd.Flags().StringVarP(&email, "email", "e", "", "Apple ID email address or phone number (required)")
 	cmd.Flags().StringVarP(&password, "password", "p", "", "password for the Apple ID (required)")
 	cmd.Flags().StringVar(&authCode, "auth-code", "", "2FA code for the Apple ID")
-
-	_ = cmd.MarkFlagRequired("email")
 
 	return cmd
 }

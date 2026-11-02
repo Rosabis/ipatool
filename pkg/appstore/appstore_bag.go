@@ -1,8 +1,11 @@
 package appstore
 
 import (
+	"errors"
 	"fmt"
 	gohttp "net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/majd/ipatool/v2/pkg/http"
@@ -11,7 +14,9 @@ import (
 type BagInput struct{}
 
 type BagOutput struct {
+	// AuthEndpoint is retained for callers that inspect the bag directly.
 	AuthEndpoint string
+	SAPConfig    SAPConfig
 }
 
 func (t *appstore) Bag(input BagInput) (BagOutput, error) {
@@ -20,39 +25,60 @@ func (t *appstore) Bag(input BagInput) (BagOutput, error) {
 		return BagOutput{}, fmt.Errorf("failed to get mac address: %w", err)
 	}
 
-	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
-	req := t.bagRequest(guid)
-
-	res, err := t.bagClient.Send(req)
+	guid, _, err := machineIdentity(macAddr)
 	if err != nil {
-		return BagOutput{}, fmt.Errorf("failed to send http request: %w", err)
+		return BagOutput{}, err
+	}
+
+	return t.bag(guid)
+}
+
+func (t *appstore) bag(guid string) (BagOutput, error) {
+	bag, err := t.fetchURLBag(guid)
+	if err != nil {
+		return BagOutput{}, err
+	}
+
+	version, err := strconv.ParseUint(bag.SAPVersion, 10, 32)
+	if err != nil {
+		return BagOutput{}, fmt.Errorf("invalid SAP version %q in bag: %w", bag.SAPVersion, err)
+	}
+
+	config := SAPConfig{
+		AuthEndpoint:   bag.AuthEndpoint,
+		SetupURL:       bag.SAPSetupEndpoint,
+		CertificateURL: bag.SAPSetupCertEndpoint,
+		Version:        uint32(version),
+	}
+	if err := validateSAPConfig(config); err != nil {
+		return BagOutput{}, err
+	}
+
+	authURL, err := url.Parse(config.AuthEndpoint)
+	if err != nil {
+		return BagOutput{}, fmt.Errorf("failed to parse authentication endpoint: %w", err)
+	}
+
+	// The bare path can return unusable responses, including a 301 without
+	// Location. Normalize only the validated bag URL, retaining its host and query.
+	authURL.Path = PrivateAppStoreAPIPathAuth + "/"
+	config.AuthEndpoint = authURL.String()
+
+	return BagOutput{AuthEndpoint: config.AuthEndpoint, SAPConfig: config}, nil
+}
+
+// Download endpoints do not require the authentication-specific SAP configuration.
+func (t *appstore) fetchURLBag(guid string) (urlBag, error) {
+	res, err := t.bagClient.Send(t.bagRequest(guid))
+	if err != nil {
+		return urlBag{}, fmt.Errorf("failed to send http request: %w", err)
 	}
 
 	if res.StatusCode != gohttp.StatusOK {
-		return BagOutput{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
+		return urlBag{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
 	}
 
-	endpoint := res.Data.AuthEndpoint
-	if endpoint == "" {
-		endpoint = res.Data.URLBag.AuthEndpoint
-	}
-	// The new auth endpoint requires the /fast sub-path WITH a trailing slash.
-	// Without the trailing slash Apple returns 301 + an HTML redirect page
-	// (which the plist parser chokes on), and only the appstored UA gets a
-	// (download-grade) token. With the slash, the Configurator UA mints a
-	// commerce-grade token that buyProduct accepts.
-	if strings.Contains(endpoint, "auth.itunes.apple.com") {
-		if !strings.HasSuffix(endpoint, "/fast") && !strings.HasSuffix(endpoint, "/fast/") {
-			endpoint = endpoint + "/fast"
-		}
-		if !strings.HasSuffix(endpoint, "/") {
-			endpoint = endpoint + "/"
-		}
-	}
-
-	return BagOutput{
-		AuthEndpoint: endpoint,
-	}, nil
+	return res.Data.URLBag, nil
 }
 
 type bagResult struct {
@@ -61,7 +87,59 @@ type bagResult struct {
 }
 
 type urlBag struct {
-	AuthEndpoint string `plist:"authenticateAccount,omitempty"`
+	AuthEndpoint         string `plist:"authenticateAccount,omitempty"`
+	EntDownloadEndpoint  string `plist:"volumeStoreDownloadProduct,omitempty"`
+	RedownloadEndpoint   string `plist:"redownloadProduct,omitempty"`
+	UpdateEndpoint       string `plist:"updateProduct,omitempty"`
+	SAPSetupEndpoint     string `plist:"sign-sap-setup,omitempty"`
+	SAPSetupCertEndpoint string `plist:"sign-sap-setup-cert,omitempty"`
+	SAPVersion           string `plist:"sign-sap-version,omitempty"`
+}
+
+func validateSAPConfig(config SAPConfig) error {
+	if err := validateAuthenticationEndpoint(config.AuthEndpoint); err != nil {
+		return err
+	}
+
+	endpoints := []struct {
+		name string
+		url  string
+	}{
+		{name: "SAP setup", url: config.SetupURL},
+		{name: "SAP setup certificate", url: config.CertificateURL},
+	}
+
+	for _, endpoint := range endpoints {
+		parsed, err := url.ParseRequestURI(endpoint.url)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			return fmt.Errorf("invalid %s endpoint %q in bag", endpoint.name, endpoint.url)
+		}
+	}
+
+	if config.Version != 200 {
+		return fmt.Errorf("unsupported SAP version %d in bag", config.Version)
+	}
+
+	return nil
+}
+
+func validateAuthenticationEndpoint(endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawPath != "" || (parsed.Port() != "" && parsed.Port() != "443") {
+		return errors.New("invalid authentication endpoint")
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if host != PrivateAppStoreAPIDomain && !strings.HasSuffix(host, "-buy.itunes.apple.com") {
+		return errors.New("unsupported authentication endpoint")
+	}
+
+	if parsed.Path != PrivateAppStoreAPIPathAuth && parsed.Path != PrivateAppStoreAPIPathAuth+"/" {
+		return errors.New("unsupported authentication endpoint")
+	}
+
+	return nil
 }
 
 func (*appstore) bagRequest(guid string) http.Request {

@@ -1,15 +1,19 @@
 package appstore
 
 import (
+	"time"
+
 	"github.com/rs/zerolog"
 )
 
 type App struct {
-	ID       int64   `json:"trackId,omitempty"`
-	BundleID string  `json:"bundleId,omitempty"`
-	Name     string  `json:"trackName,omitempty"`
-	Version  string  `json:"version,omitempty"`
-	Price    float64 `json:"price,omitempty"`
+	ID           int64      `json:"trackId,omitempty"`
+	BundleID     string     `json:"bundleId,omitempty"`
+	Name         string     `json:"trackName,omitempty"`
+	Version      string     `json:"version,omitempty"`
+	Price        float64    `json:"price,omitempty"`
+	PurchaseDate time.Time  `json:"purchaseDate,omitzero"`
+	Platforms    []Platform `json:"platforms,omitzero"`
 }
 
 type VersionHistoryInfo struct {
@@ -40,4 +44,17 @@ func (a App) MarshalZerologObject(event *zerolog.Event) {
 		Str("name", a.Name).
 		Str("version", a.Version).
 		Float64("price", a.Price)
+
+	if !a.PurchaseDate.IsZero() {
+		event.Time("purchaseDate", a.PurchaseDate)
+	}
+
+	if a.Platforms != nil {
+		platforms := make([]string, len(a.Platforms))
+		for index, platform := range a.Platforms {
+			platforms[index] = string(platform)
+		}
+
+		event.Strs("platforms", platforms)
+	}
 }

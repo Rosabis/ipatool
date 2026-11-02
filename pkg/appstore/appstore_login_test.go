@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/majd/ipatool/v2/pkg/http"
 	"github.com/majd/ipatool/v2/pkg/keychain"
@@ -24,27 +25,115 @@ var _ = Describe("AppStore (Login)", func() {
 	)
 
 	var (
-		ctrl         *gomock.Controller
-		as           AppStore
-		mockKeychain *keychain.MockKeychain
-		mockClient   *http.MockClient[loginResult]
-		mockMachine  *machine.MockMachine
+		ctrl          *gomock.Controller
+		as            *appstore
+		mockKeychain  *keychain.MockKeychain
+		mockClient    *http.MockClient[loginResult]
+		mockBagClient *http.MockClient[bagResult]
+		mockMachine   *machine.MockMachine
+		signer        *stubActionSigner
 	)
 
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockKeychain = keychain.NewMockKeychain(ctrl)
 		mockClient = http.NewMockClient[loginResult](ctrl)
+		mockBagClient = http.NewMockClient[bagResult](ctrl)
 		mockMachine = machine.NewMockMachine(ctrl)
+		signer = &stubActionSigner{}
 		as = &appstore{
-			keychain:    mockKeychain,
-			loginClient: mockClient,
-			machine:     mockMachine,
+			keychain:       mockKeychain,
+			loginClient:    mockClient,
+			bagClient:      mockBagClient,
+			machine:        mockMachine,
+			authRetrySleep: func(time.Duration) {},
+			actionSignerFactory: func(config SAPConfig, machineID []byte) (ActionSigner, error) {
+				Expect(config).To(Equal(validSAPConfig()))
+				Expect(machineID).To(Equal([]byte{0, 0, 0, 0, 0, 0}))
+
+				return signer, nil
+			},
 		}
 	})
 
 	AfterEach(func() {
 		ctrl.Finish()
+	})
+
+	DescribeTable("rejects malformed 2FA codes before preparing authentication", func(code string) {
+		_, err := as.Login(LoginInput{AuthCode: code})
+
+		Expect(err).To(MatchError("2FA code must contain exactly six digits"))
+	},
+		Entry("whitespace only", " \t\r\n"),
+		Entry("too short", "12345"),
+		Entry("too long", "1234567"),
+		Entry("letters", "12345a"),
+		Entry("non-ASCII digits", "１２３４５６"),
+		Entry("other escape sequences", "\x1b[31m123456"),
+		Entry("unmatched paste marker", "\x1b[200~123456"),
+		Entry("empty paste", "\x1b[200~\x1b[201~"),
+		Entry("embedded paste markers", "123\x1b[200~456\x1b[201~"),
+	)
+
+	Describe("transient authentication responses", func() {
+		DescribeTable("retries the same request until it succeeds", func(appleID, storefront string) {
+			request := as.loginRequest(appleID, testPassword, "", "guid", testAuthEndpoint, 1, signer)
+			responses := []struct {
+				result http.Result[loginResult]
+				err    error
+			}{
+				{err: &http.UnexpectedResponseError{StatusCode: 204}},
+				{err: &http.UnexpectedResponseError{StatusCode: 404}},
+				{result: http.Result[loginResult]{StatusCode: 200}},
+			}
+			call := 0
+			mockClient.EXPECT().
+				Send(gomock.Any()).
+				DoAndReturn(func(actual http.Request) (http.Result[loginResult], error) {
+					Expect(actual.URL).To(Equal(request.URL))
+					Expect(actual.Headers["X-Apple-Store-Front"]).To(Equal(storefront))
+					Expect(actual.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("appleId", appleID))
+					Expect(actual.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("attempt", "1"))
+					response := responses[call]
+					call++
+
+					return response.result, response.err
+				}).
+				Times(3)
+
+			result, err := as.sendAuthenticationRequest(request)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.StatusCode).To(Equal(200))
+		},
+			Entry("email account", testEmail, ""),
+			Entry("Chinese phone account", "+8613912345678", "143465"),
+			Entry("Indian phone account", "9123456789", "143467"),
+		)
+
+		DescribeTable("bounds retries to transient statuses",
+			func(status, expectedCalls int) {
+				request := as.loginRequest(testEmail, testPassword, "", "guid", testAuthEndpoint, 1, signer)
+				responseErr := &http.UnexpectedResponseError{StatusCode: status}
+				mockClient.EXPECT().
+					Send(gomock.Any()).
+					Return(http.Result[loginResult]{}, responseErr).
+					Times(expectedCalls)
+
+				_, err := as.sendAuthenticationRequest(request)
+
+				Expect(errors.Is(err, responseErr)).To(BeTrue())
+				if expectedCalls == maxAuthenticationRequestAttempts {
+					Expect(err.Error()).To(ContainSubstring("after 3 attempts"))
+					Expect(err.Error()).To(ContainSubstring(fmt.Sprintf("HTTP %d, %d, %d", status, status, status)))
+				}
+			},
+			Entry("retries and then stops for HTTP 204", 204, maxAuthenticationRequestAttempts),
+			Entry("retries and then stops for HTTP 503", 503, maxAuthenticationRequestAttempts),
+			Entry("retries and then stops for non-plist HTTP 403", 403, maxAuthenticationRequestAttempts),
+			Entry("does not retry HTTP 401", 401, 1),
+		)
 	})
 
 	When("fails to read Machine's MAC address", func() {
@@ -67,13 +156,50 @@ var _ = Describe("AppStore (Login)", func() {
 			mockMachine.EXPECT().
 				MacAddress().
 				Return("00:00:00:00:00:00", nil)
+			mockBagClient.EXPECT().
+				Send(gomock.Any()).
+				Do(func(req http.Request) {
+					Expect(req.URL).To(Equal("https://init.itunes.apple.com/bag.xml?guid=000000000000"))
+				}).
+				Return(http.Result[bagResult]{
+					StatusCode: 200,
+					Data:       validBagResult(),
+				}, nil)
 		})
 
+		DescribeTable("normalizes 2FA codes without changing the password", func(code, suffix string) {
+			const password = " \tpäss word\n"
+			mockClient.EXPECT().Send(gomock.Any()).DoAndReturn(func(req http.Request) (http.Result[loginResult], error) {
+				Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
+				Expect(req.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("password", password+suffix))
+
+				return http.Result[loginResult]{}, errors.New("test complete")
+			})
+
+			_, err := as.Login(LoginInput{Password: password, AuthCode: code})
+
+			Expect(err).To(MatchError(ContainSubstring("test complete")))
+		},
+			Entry("no code on initial login", "", ""),
+			Entry("plain code with leading zero", "012345", "012345"),
+			Entry("spaces", "123 456", "123456"),
+			Entry("Unicode whitespace", "\t123\u00a0456\r\n", "123456"),
+			Entry("bracketed paste", "\x1b[200~123456\x1b[201~", "123456"),
+			Entry("bracketed paste with whitespace", " \x1b[200~123 456\n\x1b[201~\r\n", "123456"),
+		)
+
 		When("client returns error", func() {
+			var clientErr error
+
 			BeforeEach(func() {
+				clientErr = errors.New("client error")
 				mockClient.EXPECT().
 					Send(gomock.Any()).
-					Return(http.Result[loginResult]{}, errors.New(""))
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
+						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
+					}).
+					Return(http.Result[loginResult]{}, clientErr)
 			})
 
 			It("returns wrapped error", func() {
@@ -81,66 +207,32 @@ var _ = Describe("AppStore (Login)", func() {
 					Password: testPassword,
 				})
 				Expect(err).To(HaveOccurred())
+				Expect(errors.Is(err, clientErr)).To(BeTrue())
+				Expect(signer.closeCalls).To(Equal(1))
+			})
+
+			It("preserves both the request and cleanup errors", func() {
+				cleanupErr := errors.New("cleanup failed")
+				signer.closeErr = cleanupErr
+
+				_, err := as.Login(LoginInput{Password: testPassword})
+				Expect(errors.Is(err, clientErr)).To(BeTrue())
+				Expect(errors.Is(err, cleanupErr)).To(BeTrue())
+				Expect(err.Error()).To(ContainSubstring("failed to close SAP action signer"))
+				Expect(signer.closeCalls).To(Equal(1))
 			})
 		})
 
-		When("normalizes the native authentication endpoint", func() {
+		When("the SAP signer fails to initialize", func() {
 			BeforeEach(func() {
-				mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal("https://auth.itunes.apple.com/auth/v1/native/fast/"))
-					}).
-					Return(http.Result[loginResult]{}, errors.New("stop"))
+				as.actionSignerFactory = func(SAPConfig, []byte) (ActionSigner, error) {
+					return nil, errors.New("signer error")
+				}
 			})
 
-			It("appends the trailing slash", func() {
-				_, err := as.Login(LoginInput{
-					Password: testPassword,
-					Endpoint: "https://auth.itunes.apple.com/auth/v1/native/fast",
-				})
-				Expect(err).To(HaveOccurred())
-			})
-		})
-
-		When("native authentication returns an empty response", func() {
-			const podURL = "https://p7-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?Pod=7&PRH=7"
-
-			BeforeEach(func() {
-				native := mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal("https://auth.itunes.apple.com/auth/v1/native/fast/"))
-					}).
-					Return(http.Result[loginResult]{}, &http.UnexpectedResponseError{StatusCode: 204})
-				legacy := mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal(legacyAuthenticateEndpoint))
-						payload := req.Payload.(*http.XMLPayload)
-						Expect(payload.Content).To(HaveKeyWithValue("attempt", "1"))
-					}).
-					Return(http.Result[loginResult]{
-						StatusCode: 302,
-						Headers:    map[string]string{"Location": podURL},
-					}, nil)
-				pod := mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal(podURL))
-						payload := req.Payload.(*http.XMLPayload)
-						Expect(payload.Content).To(HaveKeyWithValue("attempt", "1"))
-					}).
-					Return(http.Result[loginResult]{}, errors.New("stop after pod redirect"))
-				gomock.InOrder(native, legacy, pod)
-			})
-
-			It("falls back to legacy authentication and reposts the plist to the assigned pod", func() {
-				_, err := as.Login(LoginInput{
-					Password: testPassword,
-					Endpoint: "https://auth.itunes.apple.com/auth/v1/native/fast",
-				})
-				Expect(err).To(MatchError("request failed: stop after pod redirect"))
+			It("returns a wrapped error", func() {
+				_, err := as.Login(LoginInput{Password: testPassword})
+				Expect(err).To(MatchError("failed to initialize SAP action signer: signer error"))
 			})
 		})
 
@@ -148,6 +240,9 @@ var _ = Describe("AppStore (Login)", func() {
 			BeforeEach(func() {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
+					}).
 					Return(http.Result[loginResult]{
 						Data: loginResult{
 							FailureType: FailureTypeInvalidCredentials,
@@ -208,6 +303,7 @@ var _ = Describe("AppStore (Login)", func() {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
 					Return(http.Result[loginResult]{
+						StatusCode: 200,
 						Data: loginResult{
 							FailureType:     "",
 							CustomerMessage: CustomerMessageBadLogin,
@@ -221,17 +317,26 @@ var _ = Describe("AppStore (Login)", func() {
 				})
 				Expect(err).To(Equal(ErrAuthCodeRequired))
 			})
+
+			It("reports an incomplete verification when a code was already supplied", func() {
+				_, err := as.Login(LoginInput{Password: testPassword, AuthCode: "123456"})
+
+				Expect(err).To(MatchError("apple did not complete verification; try a fresh 2FA code"))
+				Expect(errors.Is(err, ErrAuthCodeRequired)).To(BeFalse())
+			})
 		})
 
 		When("store API redirects", func() {
 			const (
-				testRedirectLocation = "https://test-redirect-url.com"
+				testRedirectLocation = "https://p42-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
 			)
 
 			BeforeEach(func() {
 				firstCall := mockClient.EXPECT().
 					Send(gomock.Any()).
 					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
+						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
 						Expect(req.Payload).To(BeAssignableToTypeOf(&http.XMLPayload{}))
 						x := req.Payload.(*http.XMLPayload)
 						Expect(x.Content).To(HaveKeyWithValue("attempt", "1"))
@@ -244,6 +349,7 @@ var _ = Describe("AppStore (Login)", func() {
 					Send(gomock.Any()).
 					Do(func(req http.Request) {
 						Expect(req.URL).To(Equal(testRedirectLocation))
+						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
 						Expect(req.Payload).To(BeAssignableToTypeOf(&http.XMLPayload{}))
 						x := req.Payload.(*http.XMLPayload)
 						Expect(x.Content).To(HaveKeyWithValue("attempt", "1"))
@@ -256,7 +362,23 @@ var _ = Describe("AppStore (Login)", func() {
 				_, err := as.Login(LoginInput{
 					Password: testPassword,
 				})
-				Expect(err).To(MatchError("request failed: test complete"))
+				Expect(err).To(MatchError("sign-in at Store pod request failed: test complete"))
+			})
+		})
+
+		When("store API redirects outside Apple's authentication pods", func() {
+			BeforeEach(func() {
+				mockClient.EXPECT().
+					Send(gomock.Any()).
+					Return(http.Result[loginResult]{
+						StatusCode: 302,
+						Headers:    map[string]string{"Location": "https://example.com/steal"},
+					}, nil)
+			})
+
+			It("rejects the redirect before reposting credentials", func() {
+				_, err := as.Login(LoginInput{Password: testPassword})
+				Expect(err).To(MatchError(ContainSubstring("invalid authentication redirect")))
 			})
 		})
 
@@ -320,7 +442,36 @@ var _ = Describe("AppStore (Login)", func() {
 					Expect(out.Account.Email).To(Equal(testEmail))
 					Expect(out.Account.Name).To(Equal(strings.Join([]string{testFirstName, testLastName}, " ")))
 				})
+
+				It("returns the persisted account with a signer cleanup error", func() {
+					cleanupErr := errors.New("cleanup failed")
+					signer.closeErr = cleanupErr
+
+					out, err := as.Login(LoginInput{Password: testPassword})
+					Expect(errors.Is(err, cleanupErr)).To(BeTrue())
+					Expect(err.Error()).To(ContainSubstring("failed to close SAP action signer"))
+					Expect(out.Account.Email).To(Equal(testEmail))
+					Expect(signer.closeCalls).To(Equal(1))
+				})
 			})
 		})
 	})
 })
+
+type stubActionSigner struct {
+	closeCalls int
+	closeErr   error
+	signCalls  int
+}
+
+func (s *stubActionSigner) Sign(data []byte) ([]byte, error) {
+	s.signCalls++
+
+	return append([]byte(nil), data...), nil
+}
+
+func (s *stubActionSigner) Close() error {
+	s.closeCalls++
+
+	return s.closeErr
+}

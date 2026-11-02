@@ -1,7 +1,9 @@
 package machine
 
 import (
-	"syscall"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
@@ -30,30 +32,41 @@ var _ = Describe("Machine", func() {
 		})
 	})
 
-	When("OperatingSystem is darwin", func() {
+	When("reading the home directory", func() {
+		var expected string
+
 		BeforeEach(func() {
-			mockOS.EXPECT().
-				Getenv("HOME").
-				Return("/home/test")
+			if runtime.GOOS == "windows" {
+				mockOS.EXPECT().Getenv("HOMEDRIVE").Return("C:")
+				mockOS.EXPECT().Getenv("HOMEPATH").Return(`\Users\test`)
+				expected = filepath.Join("C:", `\Users\test`)
+			} else {
+				mockOS.EXPECT().Getenv("HOME").Return("/home/test")
+				expected = "/home/test"
+			}
 		})
 
-		It("returns home directory from HOME", func() {
+		It("returns the platform home directory", func() {
 			dir := machine.HomeDirectory()
-			Expect(dir).To(Equal("/home/test"))
+			Expect(dir).To(Equal(expected))
 		})
 	})
 
 	When("machine has network interfaces", func() {
-		It("returns MAC address of the first interface", func() {
+		It("returns a usable MAC address", func() {
 			res, err := machine.MacAddress()
 			Expect(err).ToNot(HaveOccurred())
 			Expect(res).To(ContainSubstring(":"))
+
+			if runtime.GOOS == "darwin" {
+				Expect(res).ToNot(Equal("02:00:00:00:00:00"))
+			}
 		})
 	})
 
 	When("reading password from stdout", func() {
 		It("returns error", func() {
-			_, err := machine.ReadPassword(syscall.Stdout)
+			_, err := machine.ReadPassword(int(os.Stdout.Fd()))
 			Expect(err).To(HaveOccurred())
 		})
 	})
